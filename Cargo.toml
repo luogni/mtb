@@ -1,0 +1,13 @@
+[package]
+name = "mtb"
+version = "0.1.0"
+authors = ["Luca Ognibene <luca.ognibene@gmail.com>"]
+
+[dependencies]
+slippy-map-tiles = "0.8.0"
+piston2d-graphics = "0.21.1"
+image = "0.12.2"
+docopt = "0.7.0"
+rustc-serialize = "0.3"
+xml-rs = "0.3.5"
+hyper = "0.10.4"
