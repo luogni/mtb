@@ -131,19 +131,33 @@ fn download_tile(tile: &Tile) -> Option<image::DynamicImage> {
 }
 
 fn draw(bbox: &BBox, all: &Vec<LatLon>, zoom: u8) {
-    let mut first = true;
-    
+    let w = 512;
+    let h = 512;
+    let mut tiles: Vec<Tile> = Vec::new();
+
     for tile in bbox.tiles() {
         if tile.zoom() == zoom {
-            println!("{:?}", tile);
-            if first == true {
-                if let Some(img) = download_tile(&tile) {
-                    
-                    first = false;
-                }
-            }
+            tiles.push(tile);
         }else if tile.zoom() > zoom { break }
     }
+    
+    let xmin = tiles.iter().min_by(|t1, t2| t1.x().cmp(&t2.x())).unwrap();
+    let xmax = tiles.iter().max_by(|t1, t2| t1.x().cmp(&t2.x())).unwrap();
+    let ymin = tiles.iter().min_by(|t1, t2| t1.y().cmp(&t2.y())).unwrap();
+    let ymax = tiles.iter().max_by(|t1, t2| t1.y().cmp(&t2.y())).unwrap();
+    println!("{} {} {} {}", xmin.x(), xmax.x(), ymin.y(), ymax.y());
+    let mut img = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::new(w, h);
+    let res = 512 / std::cmp::min(xmax.x() - xmin.x() + 1, ymax.y() - ymin.y() + 1);
+    println!("{}", res);
+    
+    for tile in &tiles {
+        // println!("{:?}", tile);
+        if let Some(imgtile) = download_tile(&tile) {
+            let imgtile = imgtile.resize_exact(res, res, image::FilterType::Nearest);
+            img.copy_from(&imgtile, (tile.x() - xmin.x()) * res, (tile.y() - ymin.y()) * res);
+        }
+    }
+    let _ = img.save("output.png");
 }
 
 fn main() {
@@ -155,6 +169,7 @@ fn main() {
         let all = load_gpx(&args.arg_path);
         println!("Loaded {} points", all.len());
         let bbox = load_bbox(&all);
-        draw(&bbox, &all, 15);
+        println!("Draw!");
+        draw(&bbox, &all, 14);
     }
 }
