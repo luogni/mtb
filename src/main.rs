@@ -17,6 +17,7 @@ extern crate xml;
 extern crate slippy_map_tiles;
 extern crate hyper;
 extern crate image;
+extern crate imageproc;
 
 
 use docopt::Docopt;
@@ -24,7 +25,7 @@ use std::fs;
 use std::path::Path;
 use xml::reader::{EventReader, XmlEvent};
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use slippy_map_tiles::{LatLon, BBox, Tile};
 use hyper::Client;
 use image::GenericImage;
@@ -113,7 +114,27 @@ fn load_bbox(all: &Vec<LatLon>) -> BBox {
     bb
 }
 
+fn get_cached_tile(tile: &Tile) -> Option<image::DynamicImage> {
+    let path = Path::new("./cache/").join(tile.ts_path("png"));
+    if let Some(img) = image::open(&path).ok() {
+        return Some(img);
+    }
+    None
+}
+
+fn cache_tile(tile: &Tile, buf: &Vec<u8>) {
+    let path = Path::new("./cache/").join(tile.ts_path("png"));
+    let p = path.parent().unwrap();
+    fs::create_dir_all(p).unwrap();
+
+    let mut file = File::create(&path).unwrap();
+    file.write_all(buf.as_slice()).unwrap();
+}
+
 fn download_tile(tile: &Tile) -> Option<image::DynamicImage> {
+    if let Some(img) = get_cached_tile(&tile) {
+        return Some(img);
+    }
     let client = Client::new();
     //  http://[abc].tile.openstreetmap.org/zoom/x/y.png 
     //  http://[abc].tile.opencyclemap.org/cycle/zoom/x/y.png
@@ -124,10 +145,20 @@ fn download_tile(tile: &Tile) -> Option<image::DynamicImage> {
     if res.read_to_end(&mut buf).is_ok() {
         if let Some(img) = image::load_from_memory(&buf).ok() {
             println!("Loaded {} {}!", img.width(), img.height());
+            cache_tile(&tile, &buf);
             return Some(img);
         }
     }
     None
+}
+
+fn lat_lon_to_xy(p: LatLon, zoom: u8) -> (f32, f32) {
+    let n: f32 = 2f32.powi(zoom as i32);
+    let x: f32 = n * (p.lon() + 180f32) / 360f32;
+    let lat_rad = p.lat().to_radians();
+    let y: f32 = (1f32 - (lat_rad.tan() + (1f32 / lat_rad.cos())).ln() * std::f32::consts::FRAC_1_PI) / 2f32 * n;
+        
+    (x, y)
 }
 
 fn draw(bbox: &BBox, all: &Vec<LatLon>, zoom: u8) {
@@ -157,6 +188,8 @@ fn draw(bbox: &BBox, all: &Vec<LatLon>, zoom: u8) {
             img.copy_from(&imgtile, (tile.x() - xmin.x()) * res, (tile.y() - ymin.y()) * res);
         }
     }
+    
+    // FIXME: for each points find x/y and draw! (how? linear?)
     let _ = img.save("output.png");
 }
 
