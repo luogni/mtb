@@ -26,38 +26,97 @@ use std::path::Path;
 use xml::reader::{EventReader, XmlEvent};
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
+use std::time::Duration;
 use slippy_map_tiles::{LatLon, BBox, Tile};
 use hyper::Client;
 use image::GenericImage;
+use image::Rgba;
+use imageproc::drawing::{draw_line_segment_mut, draw_convex_polygon_mut};
+use imageproc::rect::Rect;
 
 
 const USAGE: &'static str = "
 MTB tool.
 
 Usage:
-  mtb draw <path>
+  mtb draw <path> [--zoom=<z> --imagewidth=<w> --linewidth=<w>]
   mtb (-h | --help)
   mtb --version
 
 Options:
-  -h --help     Show this screen
-  --version     Show version
+  -h --help         Show this screen.
+  --version         Show version.
+  --linewidth=<w>   Line width in pixels [default: 8].
+  --zoom=<z>        Zoom level to use [default: 13].
+  --imagewidth=<w>  Image width in pixels [default: 2048].
 ";
 
 #[derive(Debug, RustcDecodable)]
 struct Args {
     arg_path: String,
+    flag_linewidth: u8,
+    flag_zoom: u8,
+    flag_imagewidth: u32,
     cmd_draw: bool,
 }
 
-fn load_gpx(path: &String) -> Vec<LatLon> {
+#[derive(Debug, PartialEq, Clone)]
+enum LLPointType {
+    LatLon,
+    Break,
+}
+
+#[derive(Debug)]
+struct LLPoint {
+    p_type: LLPointType,
+    point: Option<LatLon>,
+}
+
+impl LLPoint {
+    fn new_point(lat: f32, lon: f32) -> LLPoint {
+        LLPoint { p_type: LLPointType::LatLon, point: LatLon::new(lat, lon) }
+    }
+
+    fn new_break() -> LLPoint {
+        LLPoint { p_type: LLPointType::Break, point: None }
+    }
+
+    fn lat(&self) -> f32 {
+        match self.point {
+            Some(ref ll) => { ll.lat() },
+            None => { 0f32 }
+        }
+    }
+
+    fn lon(&self) -> f32 {
+        match self.point {
+            Some(ref ll) => { ll.lon() },
+            None => { 0f32 }
+        }
+    }
+
+    fn point(&self) -> Option<LatLon> {
+        self.point.clone()
+    }
+
+    fn is_latlon(&self) -> bool {
+        self.p_type == LLPointType::LatLon
+    }
+
+    fn is_break(&self) -> bool {
+        self.p_type == LLPointType::Break
+    }
+}
+
+fn load_gpx(path: &String) -> Vec<LLPoint> {
     let path = Path::new(path);
-    let mut ret: Vec<LatLon> = Vec::new();
+    let mut ret: Vec<LLPoint> = Vec::new();
     println!("Loading path {:?}", path);
     if path.is_dir() {
         for entry in fs::read_dir(path).unwrap() {
             let entry = entry.unwrap();
             println!("Loading file {:?}", entry);
+            ret.push(LLPoint::new_break());
             let file = File::open(entry.path()).unwrap();
             let file = BufReader::new(file);
             let parser = EventReader::new(file);
@@ -75,9 +134,7 @@ fn load_gpx(path: &String) -> Vec<LatLon> {
                                     lon = a.value.parse().unwrap()
                                 }
                             }
-                            ret.push(LatLon::new(lat, lon).unwrap());
-                            //println!("{} {}", lat, lon);
-
+                            ret.push(LLPoint::new_point(lat, lon));
                         }
                     }
                     Ok(XmlEvent::EndElement { .. }) => {
@@ -97,17 +154,19 @@ fn load_gpx(path: &String) -> Vec<LatLon> {
 }
 
 
-fn load_bbox(all: &Vec<LatLon>) -> BBox {
+fn load_bbox(all: &Vec<LLPoint>) -> BBox {
     let mut latmin: f32 = 999f32;
     let mut latmax: f32 = -999f32;
     let mut lonmin: f32 = 999f32;
     let mut lonmax: f32 = -999f32;
 
-    for point in all {
-        if point.lat() < latmin { latmin = point.lat() }
-        if point.lat() > latmax { latmax = point.lat() }
-        if point.lon() < lonmin { lonmin = point.lon() }
-        if point.lon() > lonmax { lonmax = point.lon() }
+    for p in all {
+        if p.is_latlon() {
+            if p.lat() < latmin { latmin = p.lat() }
+            if p.lat() > latmax { latmax = p.lat() }
+            if p.lon() < lonmin { lonmin = p.lon() }
+            if p.lon() > lonmax { lonmax = p.lon() }
+        }
     }
     println!("{} {} {} {}", latmin, latmax, lonmin, lonmax);
     let bb: BBox = BBox::new(latmax, lonmin, latmin, lonmax).unwrap();
@@ -135,7 +194,8 @@ fn download_tile(tile: &Tile) -> Option<image::DynamicImage> {
     if let Some(img) = get_cached_tile(&tile) {
         return Some(img);
     }
-    let client = Client::new();
+    let mut client = Client::new();
+    client.set_read_timeout(Some(Duration::new(3, 0)));
     //  http://[abc].tile.openstreetmap.org/zoom/x/y.png 
     //  http://[abc].tile.opencyclemap.org/cycle/zoom/x/y.png
     let url = format!("http://a.tile.opencyclemap.org/cycle/{}/{}/{}.png",
@@ -144,7 +204,7 @@ fn download_tile(tile: &Tile) -> Option<image::DynamicImage> {
     let mut buf = Vec::new();
     if res.read_to_end(&mut buf).is_ok() {
         if let Some(img) = image::load_from_memory(&buf).ok() {
-            println!("Loaded {} {}!", img.width(), img.height());
+            // println!("Loaded {} {}!", img.width(), img.height());
             cache_tile(&tile, &buf);
             return Some(img);
         }
@@ -161,9 +221,8 @@ fn lat_lon_to_xy(p: LatLon, zoom: u8) -> (f32, f32) {
     (x, y)
 }
 
-fn draw(bbox: &BBox, all: &Vec<LatLon>, zoom: u8) {
-    let w = 512;
-    let h = 512;
+fn draw(bbox: &BBox, all: &Vec<LLPoint>, zoom: u8, imagewidth: u32, linewidth: u8) {
+    let w = imagewidth;
     let mut tiles: Vec<Tile> = Vec::new();
 
     for tile in bbox.tiles() {
@@ -177,19 +236,66 @@ fn draw(bbox: &BBox, all: &Vec<LatLon>, zoom: u8) {
     let ymin = tiles.iter().min_by(|t1, t2| t1.y().cmp(&t2.y())).unwrap();
     let ymax = tiles.iter().max_by(|t1, t2| t1.y().cmp(&t2.y())).unwrap();
     println!("{} {} {} {}", xmin.x(), xmax.x(), ymin.y(), ymax.y());
-    let mut img = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::new(w, h);
-    let res = 512 / std::cmp::min(xmax.x() - xmin.x() + 1, ymax.y() - ymin.y() + 1);
-    println!("{}", res);
-    
-    for tile in &tiles {
-        // println!("{:?}", tile);
-        if let Some(imgtile) = download_tile(&tile) {
-            let imgtile = imgtile.resize_exact(res, res, image::FilterType::Nearest);
-            img.copy_from(&imgtile, (tile.x() - xmin.x()) * res, (tile.y() - ymin.y()) * res);
+    let resx = w / (xmax.x() - xmin.x() + 1);
+    let h = w * ((ymax.y() - ymin.y() + 1) / (xmax.x() - xmin.x() + 1));
+    let resy = h / (ymax.y() - ymin.y() + 1);
+    let count = tiles.len();
+    println!("{} {} {} {}", resx, resy, w, h);
+    let mut img = image::ImageBuffer::<Rgba<u8>, Vec<u8>>::new(w, h);
+
+    let mut oldperc = 0;
+    for (i, tile) in tiles.iter().enumerate() {
+        let perc = (i * 100) / count;
+        if perc % 2 == 0 && oldperc != perc {
+            println!("Downloading: {}%", perc);
+            oldperc = perc;
+        }
+        'o: loop {
+            let mut maxtry = 5;
+            match download_tile(&tile) {
+                Some(imgtile) => {
+                    let imgtile = imgtile.resize_exact(resx, resy, image::FilterType::Nearest);
+                    img.copy_from(&imgtile, (tile.x() - xmin.x()) * resx, (tile.y() - ymin.y()) * resy);
+                    break 'o;
+                },
+                None => {
+                    maxtry = maxtry - 1;
+                    if maxtry == 0 {
+                        println!("Can't download this tile {:?}", tile);
+                        continue 'o;
+                    }
+                }
+            }
         }
     }
-    
-    // FIXME: for each points find x/y and draw! (how? linear?)
+
+    let mut iter = all.iter().peekable();
+    let alw: i8 = linewidth as i8 / 2 as i8;
+    loop {
+        match iter.next() {
+            Some(p) => {
+                if let Some(new) = iter.peek() {
+                    if p.is_latlon() && new.is_latlon() {
+                        // println!("draw {:?} {:?}", p, new);
+                        let (x1, y1) = lat_lon_to_xy(p.point().unwrap(), zoom);
+                        let (x2, y2) = lat_lon_to_xy(new.point().unwrap(), zoom);
+                        for lw in -alw..alw {
+                            for lh in -alw..alw {
+                                draw_line_segment_mut(&mut img,
+                                                      ((x1 - xmin.x() as f32) * resx as f32 + lw as f32,
+                                                       (y1 - ymin.y() as f32) * resy as f32 + lh as f32),
+                                                      ((x2 - xmin.x() as f32) * resx as f32 + lw as f32,
+                                                       (y2 - ymin.y() as f32) * resy as f32 + lh as f32 ),
+                                                      Rgba([255u8, 0u8, 0u8, 255u8]));
+                            }
+                        }
+                        // println!("draw {} {} {} {}", x1, y1, x2, y2);
+                    }
+                }
+            },
+            None => { break }
+        }
+    }
     let _ = img.save("output.png");
 }
 
@@ -203,6 +309,6 @@ fn main() {
         println!("Loaded {} points", all.len());
         let bbox = load_bbox(&all);
         println!("Draw!");
-        draw(&bbox, &all, 14);
+        draw(&bbox, &all, args.flag_zoom, args.flag_imagewidth, args.flag_linewidth);
     }
 }
