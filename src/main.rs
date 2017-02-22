@@ -8,8 +8,15 @@
 // FIXME:
  * no unwrap
  * error handling (gpx parsing, http requests, disk...)
- * libraries
-
+ * modules
+  * tile downloader to library?
+ * commands:
+  * auto split with clustering
+  * http://wiki.openstreetmap.org/wiki/Nominatim reverse, from latlon get a name
+  * auto name with higher points, start point, street names..
+  * after cluster split we can split a pbf file to small size to get info faster from it (there is a crate for parsing pbf files). split con osmconvert per ex.
+  * auto random names (names crate)
+  * telegram bot as api
  */
 extern crate rustc_serialize;
 extern crate docopt;
@@ -18,28 +25,30 @@ extern crate slippy_map_tiles;
 extern crate hyper;
 extern crate image;
 extern crate imageproc;
+extern crate rayon;
 
+mod llpoint;
+mod gpx;
+mod tiledl;
+mod cluster;
 
+use tiledl::download_tile;
+use llpoint::LLPoint;
+use gpx::load_gpx;
 use docopt::Docopt;
-use std::fs;
-use std::path::Path;
-use xml::reader::{EventReader, XmlEvent};
-use std::fs::File;
-use std::io::{BufReader, Read, Write};
-use std::time::Duration;
 use slippy_map_tiles::{LatLon, BBox, Tile};
-use hyper::Client;
 use image::GenericImage;
 use image::Rgba;
-use imageproc::drawing::{draw_line_segment_mut, draw_convex_polygon_mut};
-use imageproc::rect::Rect;
-
+use imageproc::drawing::{draw_line_segment_mut};
+use rayon::prelude::*;
+use std::sync::{Arc, Mutex};
 
 const USAGE: &'static str = "
 MTB tool.
 
 Usage:
   mtb draw <path> [--zoom=<z> --imagewidth=<w> --linewidth=<w>]
+  mtb cluster <path>
   mtb (-h | --help)
   mtb --version
 
@@ -58,158 +67,15 @@ struct Args {
     flag_zoom: u8,
     flag_imagewidth: u32,
     cmd_draw: bool,
+    cmd_cluster: bool,
 }
-
-#[derive(Debug, PartialEq, Clone)]
-enum LLPointType {
-    LatLon,
-    Break,
-}
-
-#[derive(Debug)]
-struct LLPoint {
-    p_type: LLPointType,
-    point: Option<LatLon>,
-}
-
-impl LLPoint {
-    fn new_point(lat: f32, lon: f32) -> LLPoint {
-        LLPoint { p_type: LLPointType::LatLon, point: LatLon::new(lat, lon) }
-    }
-
-    fn new_break() -> LLPoint {
-        LLPoint { p_type: LLPointType::Break, point: None }
-    }
-
-    fn lat(&self) -> f32 {
-        match self.point {
-            Some(ref ll) => { ll.lat() },
-            None => { 0f32 }
-        }
-    }
-
-    fn lon(&self) -> f32 {
-        match self.point {
-            Some(ref ll) => { ll.lon() },
-            None => { 0f32 }
-        }
-    }
-
-    fn point(&self) -> Option<LatLon> {
-        self.point.clone()
-    }
-
-    fn is_latlon(&self) -> bool {
-        self.p_type == LLPointType::LatLon
-    }
-
-    fn is_break(&self) -> bool {
-        self.p_type == LLPointType::Break
-    }
-}
-
-fn load_gpx(path: &String) -> Vec<LLPoint> {
-    let path = Path::new(path);
-    let mut ret: Vec<LLPoint> = Vec::new();
-    println!("Loading path {:?}", path);
-    if path.is_dir() {
-        for entry in fs::read_dir(path).unwrap() {
-            let entry = entry.unwrap();
-            println!("Loading file {:?}", entry);
-            ret.push(LLPoint::new_break());
-            let file = File::open(entry.path()).unwrap();
-            let file = BufReader::new(file);
-            let parser = EventReader::new(file);
-            for e in parser {
-                match e {
-                    Ok(XmlEvent::StartElement { name, attributes, .. }) => {
-                        if name.local_name == "trkpt" {
-                            let mut lat: f32 = 0.0;
-                            let mut lon: f32 = 0.0;
-                            
-                            for a in attributes {
-                                if a.name.local_name == "lat" {
-                                    lat = a.value.parse().unwrap()
-                                }else if a.name.local_name == "lon" {
-                                    lon = a.value.parse().unwrap()
-                                }
-                            }
-                            ret.push(LLPoint::new_point(lat, lon));
-                        }
-                    }
-                    Ok(XmlEvent::EndElement { .. }) => {
-                        //depth -= 1;
-                        //println!("{}-{}", depth, name);
-                    }
-                    Err(e) => {
-                        println!("Error: {}", e);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    ret
-}
-
 
 fn load_bbox(all: &Vec<LLPoint>) -> BBox {
-    let mut latmin: f32 = 999f32;
-    let mut latmax: f32 = -999f32;
-    let mut lonmin: f32 = 999f32;
-    let mut lonmax: f32 = -999f32;
-
-    for p in all {
-        if p.is_latlon() {
-            if p.lat() < latmin { latmin = p.lat() }
-            if p.lat() > latmax { latmax = p.lat() }
-            if p.lon() < lonmin { lonmin = p.lon() }
-            if p.lon() > lonmax { lonmax = p.lon() }
-        }
-    }
-    println!("{} {} {} {}", latmin, latmax, lonmin, lonmax);
-    let bb: BBox = BBox::new(latmax, lonmin, latmin, lonmax).unwrap();
-    bb
-}
-
-fn get_cached_tile(tile: &Tile) -> Option<image::DynamicImage> {
-    let path = Path::new("./cache/").join(tile.ts_path("png"));
-    if let Some(img) = image::open(&path).ok() {
-        return Some(img);
-    }
-    None
-}
-
-fn cache_tile(tile: &Tile, buf: &Vec<u8>) {
-    let path = Path::new("./cache/").join(tile.ts_path("png"));
-    let p = path.parent().unwrap();
-    fs::create_dir_all(p).unwrap();
-
-    let mut file = File::create(&path).unwrap();
-    file.write_all(buf.as_slice()).unwrap();
-}
-
-fn download_tile(tile: &Tile) -> Option<image::DynamicImage> {
-    if let Some(img) = get_cached_tile(&tile) {
-        return Some(img);
-    }
-    let mut client = Client::new();
-    client.set_read_timeout(Some(Duration::new(3, 0)));
-    //  http://[abc].tile.openstreetmap.org/zoom/x/y.png 
-    //  http://[abc].tile.opencyclemap.org/cycle/zoom/x/y.png
-    let url = format!("http://a.tile.opencyclemap.org/cycle/{}/{}/{}.png",
-                      tile.zoom(), tile.x(), tile.y());
-    let mut res = client.get(&url).send().unwrap();
-    let mut buf = Vec::new();
-    if res.read_to_end(&mut buf).is_ok() {
-        if let Some(img) = image::load_from_memory(&buf).ok() {
-            // println!("Loaded {} {}!", img.width(), img.height());
-            cache_tile(&tile, &buf);
-            return Some(img);
-        }
-    }
-    None
+    let fvec = all.into_iter().
+        filter(|&p| p.is_latlon()).
+        map(|p| p.point().unwrap()).
+        collect::<Vec<_>>();
+    BBox::new_from_points_list(&fvec).unwrap()
 }
 
 fn lat_lon_to_xy(p: LatLon, zoom: u8) -> (f32, f32) {
@@ -222,7 +88,7 @@ fn lat_lon_to_xy(p: LatLon, zoom: u8) -> (f32, f32) {
 }
 
 fn draw(bbox: &BBox, all: &Vec<LLPoint>, zoom: u8, imagewidth: u32, linewidth: u8) {
-    let w = imagewidth;
+    let mut w = imagewidth / 256 * 256;
     let mut tiles: Vec<Tile> = Vec::new();
 
     for tile in bbox.tiles() {
@@ -236,39 +102,42 @@ fn draw(bbox: &BBox, all: &Vec<LLPoint>, zoom: u8, imagewidth: u32, linewidth: u
     let ymin = tiles.iter().min_by(|t1, t2| t1.y().cmp(&t2.y())).unwrap();
     let ymax = tiles.iter().max_by(|t1, t2| t1.y().cmp(&t2.y())).unwrap();
     println!("{} {} {} {}", xmin.x(), xmax.x(), ymin.y(), ymax.y());
-    let resx = w / (xmax.x() - xmin.x() + 1);
-    let h = w * ((ymax.y() - ymin.y() + 1) / (xmax.x() - xmin.x() + 1));
-    let resy = h / (ymax.y() - ymin.y() + 1);
+    let resx = ((w as f32) / (xmax.x() as f32 - xmin.x() as f32 + 1f32)).floor() as u32;
+    w = resx * (xmax.x() - xmin.x() + 1);
+    let h = (w as f32 * ((ymax.y() as f32 - ymin.y() as f32 + 1f32) / (xmax.x() as f32 - xmin.x() as f32 + 1f32))).ceil() as u32;
+    let resy = resx;
     let count = tiles.len();
-    println!("{} {} {} {}", resx, resy, w, h);
+    println!("{} {} {} {} {}", resx, resy, w, h, count);
     let mut img = image::ImageBuffer::<Rgba<u8>, Vec<u8>>::new(w, h);
 
-    let mut oldperc = 0;
-    for (i, tile) in tiles.iter().enumerate() {
-        let perc = (i * 100) / count;
-        if perc % 2 == 0 && oldperc != perc {
-            println!("Downloading: {}%", perc);
-            oldperc = perc;
-        }
-        'o: loop {
-            let mut maxtry = 5;
-            match download_tile(&tile) {
-                Some(imgtile) => {
-                    let imgtile = imgtile.resize_exact(resx, resy, image::FilterType::Nearest);
-                    img.copy_from(&imgtile, (tile.x() - xmin.x()) * resx, (tile.y() - ymin.y()) * resy);
-                    break 'o;
-                },
-                None => {
-                    maxtry = maxtry - 1;
-                    if maxtry == 0 {
-                        println!("Can't download this tile {:?}", tile);
-                        continue 'o;
+    {
+        let img_thread = Arc::new(Mutex::new(&mut img));
+        for (chi, ch) in tiles.chunks(count / 100 + 1).enumerate() {
+            println!("{}", chi);
+
+            ch.par_iter().map(|tile| {
+                'o: loop {
+                    let mut maxtry = 5;
+                    match download_tile(&tile) {
+                        Some(imgtile) => {
+                            let imgtile = imgtile.resize_exact(resx, resy, image::FilterType::Triangle);
+                            img_thread.lock().unwrap().copy_from(&imgtile, (tile.x() - xmin.x()) * resx,
+                                                                 (tile.y() - ymin.y()) * resy);
+                            break 'o;
+                        },
+                        None => {
+                            maxtry = maxtry - 1;
+                            if maxtry == 0 {
+                                println!("Can't download this tile {:?}", tile);
+                                continue 'o;
+                            }
+                        }
                     }
                 }
-            }
+            }).collect::<Vec<_>>();
         }
     }
-
+                                    
     let mut iter = all.iter().peekable();
     let alw: i8 = linewidth as i8 / 2 as i8;
     loop {
@@ -305,10 +174,14 @@ fn main() {
         .unwrap_or_else(|e| e.exit());
     println!("Hello, world!: {:?}", args);
     if args.cmd_draw == true {
-        let all = load_gpx(&args.arg_path);
+        let all = load_gpx(&args.arg_path, false);
         println!("Loaded {} points", all.len());
         let bbox = load_bbox(&all);
         println!("Draw!");
         draw(&bbox, &all, args.flag_zoom, args.flag_imagewidth, args.flag_linewidth);
+    }else if args.cmd_cluster == true {
+        let all = load_gpx(&args.arg_path, true);
+        println!("Loaded {} points", all.len());
+        cluster::cluster(&all);
     }
 }
